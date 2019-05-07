@@ -1,0 +1,161 @@
+#!/usr/local/bin/luajit51
+
+local os = require "os"
+local errno = require "sys.errno"
+local sx = require "sys.socket"
+local rx = require "sys.route"
+local ix = require "sys.iface"
+local wx = require "sys.ieee80211"
+local bx = require "sys.bsd"
+local ex = require "lib.event"
+local lx = require "log"
+
+-- load config file
+local conffile = os.getenv("BIFTRU_CONF") or "/etc/biftru.conf"
+local st, conf = pcall(dofile, conffile)
+if st == false then
+	error(string.format("could not read %q: %s", conffile, conf))
+end
+
+local interface = conf.interface or error("interface is required")
+
+local verbose = conf.verbose
+if verbose == nil then
+	verbose = false
+end
+
+local debug = conf.debug
+if debug == nil then
+	debug = false
+end
+
+if not conf.networks or type(conf.networks) ~= "table" then
+	error("networks must be a table")
+end
+
+for k,v in pairs(conf.networks) do
+	if type(k) ~= "string" then
+		error("network key must be a string")
+	end
+
+	if type(v) ~= "table" then
+		error("network value must be a table")
+	end
+
+	if not v.nwid then
+		error(string.format("network %q is missing nwid", k))
+	end
+end
+
+local log = lx.new(interface, nil, verbose)
+
+if not debug then
+	assert(bx.daemon(1, 0) == 0)
+end
+
+local ifacefd = sx.socket(sx.AF_INET, sx.SOCK_DGRAM, 0);
+assert(ifacefd >= 0)
+
+local wifi = wx.new(ifacefd, interface)
+assert(wifi)
+
+local route = rx.new(rx.RTM.IFINFO)
+assert(route)
+
+local event = ex.new()
+assert(event)
+
+local link_state = ix.LINK_STATE.DOWN
+
+local rtevt, timerevt
+
+local function findnet(nets)
+	-- gross
+	for name, net in pairs(conf.networks) do
+		for _, v in pairs(nets) do
+			if net.nwid == v.nwid then
+				return name, net
+			end
+		end
+	end
+
+	return nil
+end
+
+local function retry(msg, ...)
+	local timeout = 5
+	log:printf(msg, ...)
+	log:printf("Retrying in %d seconds...", timeout)
+	event:add(timerevt, timeout * 1000)
+end
+
+local function timercb(fd, what, void)
+	if link_state ~= ix.LINK_STATE.DOWN then
+		-- all done
+		return
+	end
+
+	local rv = wifi:scan()
+	if rv == -1 then
+		retry("Scanning failure: %s", errno())
+		return
+	end
+
+	rv, nets = wifi:nodes()
+	if rv == -1 then
+		retry("Failed to get nodes: %s", errno())
+		return
+	end
+
+	local name, net = findnet(nets)
+	if not net then
+		retry("No configured network found.")
+		return
+	end
+
+	log:printf("Connecting to network %q with nwid %q...", name, net.nwid)
+
+	-- gotcha!
+	rv = wifi:connect(net.nwid, net.wpakey)
+	if rv == -1 then
+		retry("Failed to connect to network %q with nwid %q: %s", name, net.nwid, errno())
+		return
+	end
+end
+
+local function link_state_change(state)
+	link_state = state
+	if link_state == ix.LINK_STATE.DOWN then
+		log:print("Lost link")
+		event:add(timerevt, 500)
+	else
+		log:print("Got link")
+	end
+end
+
+local function routecb(fd, what, void)
+	local rv, msg = route:getmsg()
+	assert(rv >= 0)
+	assert(msg and msg.type == rx.RTM.IFINFO)
+	local ifc = ix.indextoname(msg.index)
+	assert(ifc)
+
+	if ifc == interface then
+		link_state_change(msg.data.link_state)
+	end
+
+	event:add(rtevt)
+end
+
+timerevt = event:timer(timercb)
+
+rtevt = event:event(route.fd, ex.READ, routecb)
+event:add(rtevt)
+
+log:print("Starting up")
+
+ifdata = ix.getifdata(ifacefd, interface)
+link_state_change(ifdata.link_state)
+
+event:dispatch()
+
